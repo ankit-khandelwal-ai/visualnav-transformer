@@ -148,7 +148,7 @@ def main():
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--no-show", action="store_true", help="don't open the live view window (headless machines)")
     p.add_argument("--joystick", action="store_true", help="skip NoMaD; drive with the arrow keys (needs the window)")
-    p.add_argument("--speed", type=float, default=0.5, help="joystick speed as a fraction of the robot's max v and w")
+    p.add_argument("--speed", type=float, default=1.0, help="joystick speed as a fraction of the robot's max v and w")
     p.add_argument("--hold-ms", type=int, default=400, help="joystick: an arrow key counts as held this long after its last press")
     args = p.parse_args()
     show = not args.no_show
