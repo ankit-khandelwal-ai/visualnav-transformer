@@ -39,7 +39,7 @@ WAYPOINT_IDX = 2  # which of the T predicted waypoints to steer toward (repo def
 
 # ---- TODO(calibration): fill these in from motor_test.py and measurements -------------------
 WHEEL_RADIUS_M = 0.0325  # PLACEHOLDER
-TRACK_WIDTH_M = 0.18  # PLACEHOLDER: distance between left and right wheels
+TRACK_WIDTH_M = 0.25  # PLACEHOLDER: distance between left and right wheels
 MAX_WHEEL_RPS = 1.0
 # motor id -> (side, sign). sign flips motors so that +rps drives the robot forward.
 # Layout: 1 = front-left, 2 = back-left, 3 = front-right, 4 = back-right. Signs verified with wheels up.
