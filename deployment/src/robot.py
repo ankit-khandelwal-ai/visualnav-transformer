@@ -145,6 +145,10 @@ class RobotControl:
     def act(self, action: ActionMsg) -> Tuple[float, float]:
         return self.set_velocity(*self.action_to_vel(action))
 
+    def command_velocity(self, v: float, w: float) -> Tuple[float, float]:
+        """Direct (v, w) command, e.g. from joystick mode. The robot clamps it to its own limits."""
+        return self.set_velocity(float(np.clip(v, -MAX_V, MAX_V)), float(np.clip(w, -MAX_W, MAX_W)))
+
     def stop(self):
         for _ in range(3):  # repeat in case a packet is dropped
             self.set_wheel_rps({m: 0.0 for m in WHEEL_MAP})
@@ -202,6 +206,9 @@ def main():
                 robot.stop()
                 v = w = 0.0
                 status = "timeout"
+            elif action.status == "ok" and action.velocity is not None:
+                v, w = robot.command_velocity(*action.velocity)
+                status = "joystick"
             elif action.status != "ok" or action.waypoints is None:
                 robot.stop()
                 v = w = 0.0

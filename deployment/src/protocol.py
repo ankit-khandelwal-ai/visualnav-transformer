@@ -34,6 +34,7 @@ class ActionMsg:
     spread: float = 0.0  # std of the sampled trajectories (uncertainty signal)
     status: str = "ok"  # "ok" | "warmup" | "error"
     error: str = ""
+    velocity: Optional[list] = None  # [v m/s, w rad/s] direct command (joystick mode); used instead of waypoints
 
 
 def encode_frame(msg: FrameMsg) -> list:
@@ -60,13 +61,14 @@ def encode_action(msg: ActionMsg) -> bytes:
         "spread": msg.spread,
         "status": msg.status,
         "error": msg.error,
+        "velocity": msg.velocity,
     }).encode()
 
 
 def decode_action(data: bytes) -> ActionMsg:
     d = json.loads(data)
     wp = None if d["waypoints"] is None else np.array(d["waypoints"], dtype=np.float32)
-    return ActionMsg(d["seq"], d["t_capture"], wp, d["infer_ms"], d["spread"], d["status"], d["error"])
+    return ActionMsg(d["seq"], d["t_capture"], wp, d["infer_ms"], d["spread"], d["status"], d["error"], d.get("velocity"))
 
 
 class RobotClient:
