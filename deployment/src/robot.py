@@ -42,7 +42,7 @@ WHEEL_RADIUS_M = 0.0325  # PLACEHOLDER
 TRACK_WIDTH_M = 0.18  # PLACEHOLDER: distance between left and right wheels
 MAX_WHEEL_RPS = 1.0
 # motor id -> (side, sign). sign flips motors so that +rps drives the robot forward. PLACEHOLDER.
-WHEEL_MAP = {1: ("left", +1), 2: ("right", +1), 3: ("left", +1), 4: ("right", +1)}
+WHEEL_MAP = {1: ("left", -1), 2: ("right", -1), 3: ("left", +1), 4: ("right", +1)}
 CALIBRATED = False
 # ----------------------------------------------------------------------------------------------
 
