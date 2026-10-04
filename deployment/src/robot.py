@@ -7,6 +7,7 @@ On the Mac (loopback test with the webcam):
     python robot.py --host localhost
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -130,24 +131,33 @@ class RobotControl:
             rps[motor] = float(np.clip(r, -MAX_WHEEL_RPS, MAX_WHEEL_RPS))
         return rps
 
+    def set_wheel_rps(self, rps: dict):
+        """Raw per-motor command {motor_id: rps}, bypassing WHEEL_MAP signs. No-op on a dry run."""
+        if self.board is not None:
+            self.board.set_motor_speed([[m, r] for m, r in rps.items()])
+
     def set_velocity(self, v: float, w: float) -> Tuple[float, float]:
         v, w = self.safety_filter(v, w)
-        if self.board is not None:
-            self.board.set_motor_speed([[m, r] for m, r in self.vel_to_wheel_rps(v, w).items()])
+        self.set_wheel_rps(self.vel_to_wheel_rps(v, w))
         return v, w
 
     def act(self, action: ActionMsg) -> Tuple[float, float]:
         return self.set_velocity(*self.action_to_vel(action))
 
     def stop(self):
-        if self.board is not None:
-            for _ in range(3):  # repeat in case a packet is dropped
-                self.board.set_motor_speed([[m, 0.0] for m in WHEEL_MAP])
-                time.sleep(0.02)
+        for _ in range(3):  # repeat in case a packet is dropped
+            self.set_wheel_rps({m: 0.0 for m in WHEEL_MAP})
+            time.sleep(0.02)
+
+
+def find_port() -> Optional[str]:
+    if os.path.exists("/dev/rrc"):
+        return "/dev/rrc"
+    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    return candidates[0] if candidates else None
 
 
 def open_board(port: Optional[str]):
-    from motor_test import find_port
     from ros_robot_controller_sdk import Board
 
     port = port or find_port()
