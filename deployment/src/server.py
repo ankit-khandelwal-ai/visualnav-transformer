@@ -3,7 +3,8 @@
 On the Mac (needs PYTHONPATH to include the diffusion_policy repo, see latency_bench.py):
     python server.py                  # picks mps/cuda/cpu automatically
     python server.py --num-samples 8 --device mps
-    python server.py --joystick       # no NoMaD: drive the robot with the arrow keys (click the window first)
+    python server.py --joystick       # NoMaD still runs and is displayed, but the robot gets your arrow-key
+                                      # commands instead (click the window first)
 """
 import argparse
 import collections
@@ -132,10 +133,9 @@ def render(frame: FrameMsg, action: ActionMsg) -> np.ndarray:
             cv2.polylines(panel, [np.array(pts, np.int32)], False, color, 2 if s == 0 else 1)
         cv2.circle(panel, pts[3], 6, (0, 255, 255), -1)  # sample 0, waypoint index 2: where the robot steers
 
+    lines = [f"seq {frame.seq}  {action.status}", f"infer {action.infer_ms:.0f} ms  spread {action.spread:.2f}"]
     if action.velocity is not None:
-        lines = [f"seq {frame.seq}  JOYSTICK", f"v {action.velocity[0]:+.2f} m/s  w {action.velocity[1]:+.2f} rad/s"]
-    else:
-        lines = [f"seq {frame.seq}  {action.status}", f"infer {action.infer_ms:.0f} ms  spread {action.spread:.2f}"]
+        lines.append(f"JOYSTICK  v {action.velocity[0]:+.2f} m/s  w {action.velocity[1]:+.2f} rad/s")
     for i, text in enumerate(lines):
         cv2.putText(img, text, (8, 22 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return np.hstack([img, panel])
@@ -147,7 +147,8 @@ def main():
     p.add_argument("--device", default=default_device())
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--no-show", action="store_true", help="don't open the live view window (headless machines)")
-    p.add_argument("--joystick", action="store_true", help="skip NoMaD; drive with the arrow keys (needs the window)")
+    p.add_argument("--joystick", action="store_true",
+                   help="send arrow-key commands to the robot instead of NoMaD's (NoMaD still runs and is displayed)")
     p.add_argument("--speed", type=float, default=1.0, help="joystick speed as a fraction of the robot's max v and w")
     p.add_argument("--hold-ms", type=int, default=400, help="joystick: an arrow key counts as held this long after its last press")
     args = p.parse_args()
@@ -157,19 +158,16 @@ def main():
     if not 0 < args.speed <= 1:
         raise SystemExit("--speed must be in (0, 1]")
 
-    explorer = None
-    if not args.joystick:
-        if not os.path.exists(WEIGHTS):
-            raise SystemExit(f"Missing weights: {WEIGHTS}")
-        explorer = NomadExplorer(args.device, args.num_samples)
+    if not os.path.exists(WEIGHTS):
+        raise SystemExit(f"Missing weights: {WEIGHTS}")
+    explorer = NomadExplorer(args.device, args.num_samples)
     server = InferenceServer(args.port)
     keys = KeyPoller(args.hold_ms / 1000)
     if show:  # create the window up front so it can take keyboard focus
         cv2.imshow(WINDOW, np.full((VIEW_SIZE, 2 * VIEW_SIZE, 3), 30, np.uint8))
+    print(f"NoMaD ready on {args.device}; waiting for frames on port {args.port}")
     if args.joystick:
-        print(f"JOYSTICK mode (no NoMaD): click the window, arrows drive, space/s stops, q quits. Waiting for frames on port {args.port}")
-    else:
-        print(f"NoMaD ready on {args.device}; waiting for frames on port {args.port}")
+        print("JOYSTICK: the robot gets your commands, not NoMaD's. Click the window; arrows drive, space/s stops, q quits.")
 
     try:
         while not keys.quit:
@@ -179,13 +177,12 @@ def main():
                 keys.poll()
             if frame is None:
                 continue
-            if args.joystick:
-                action = ActionMsg(frame.seq, frame.t_capture, velocity=keys.command(args.speed))
-            else:
-                try:
-                    action = explorer.step(frame)
-                except Exception as e:  # always answer, or the REQ/REP pair deadlocks
-                    action = ActionMsg(frame.seq, frame.t_capture, status="error", error=repr(e))
+            try:
+                action = explorer.step(frame)
+            except Exception as e:  # always answer, or the REQ/REP pair deadlocks
+                action = ActionMsg(frame.seq, frame.t_capture, status="error", error=repr(e))
+            if args.joystick:  # NoMaD's output is only displayed; the robot follows the keys
+                action.velocity = keys.command(args.speed)
             server.send_action(action)
             print(f"seq {frame.seq}: {action.status} infer {action.infer_ms:.1f} ms spread {action.spread:.3f} "
                   f"vel {action.velocity} {action.error}")

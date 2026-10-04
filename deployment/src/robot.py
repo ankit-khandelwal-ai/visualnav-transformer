@@ -206,7 +206,7 @@ def main():
                 robot.stop()
                 v = w = 0.0
                 status = "timeout"
-            elif action.status == "ok" and action.velocity is not None:
+            elif action.velocity is not None:  # joystick: a direct command, whatever the model's status is
                 v, w = robot.command_velocity(*action.velocity)
                 status = "joystick"
             elif action.status != "ok" or action.waypoints is None:
