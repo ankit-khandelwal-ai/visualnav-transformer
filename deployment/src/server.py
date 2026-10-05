@@ -20,6 +20,7 @@ from PIL import Image
 
 from latency_bench import build_model, sync, to_tensor
 from protocol import DEFAULT_PORT, ActionMsg, FrameMsg, InferenceServer
+from robot import DT, WAYPOINT_IDX, RobotControl
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOMAD_CFG = os.path.join(HERE, "../../train/config/nomad.yaml")
@@ -36,12 +37,28 @@ def default_device() -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-class NomadExplorer:
-    """Goal-masked NoMaD: keeps a context of recent frames and samples collision-free trajectories."""
+SELECT_MODES = ("first", "forward", "consistent", "blend")
 
-    def __init__(self, device: str, num_samples: int):
+
+class NomadExplorer:
+    """Goal-masked NoMaD: keeps a context of recent frames and samples collision-free trajectories.
+
+    The diffusion head returns `num_samples` independent modes per frame. Taking a fixed index
+    means the robot follows a fresh random mode every step, which shows up as heading dither and
+    looping. `select` ranks the samples and reorders them so the chosen one is waypoints[0] (what
+    the clients follow and what render() draws in green); "first" keeps the old behaviour exactly.
+    """
+
+    def __init__(self, device: str, num_samples: int, select: str = "blend",
+                 consistency_weight: float = 0.7, waypoint_idx: int = WAYPOINT_IDX):
+        if select not in SELECT_MODES:
+            raise ValueError(f"select must be one of {SELECT_MODES}")
         self.device = torch.device(device)
         self.num_samples = num_samples
+        self.select = select
+        self.consistency_weight = consistency_weight
+        self.waypoint_idx = waypoint_idx
+        self.prev_heading = None  # last chosen heading, rotated into the current frame
         self.cfg = yaml.safe_load(open(NOMAD_CFG))
         stats = yaml.safe_load(open(DATA_CFG))["action_stats"]
         self.stat_min, self.stat_max = np.array(stats["min"]), np.array(stats["max"])
@@ -54,6 +71,9 @@ class NomadExplorer:
 
     @torch.no_grad()
     def step(self, frame: FrameMsg) -> ActionMsg:
+        if frame.seq == 0:  # clients restart seq at 0 for each run: don't leak the previous run's frames
+            self.context.clear()
+            self.prev_heading = None
         self.context.append(Image.fromarray(frame.image))
         if len(self.context) < self.context.maxlen:
             return ActionMsg(frame.seq, frame.t_capture, status="warmup")
@@ -75,8 +95,43 @@ class NomadExplorer:
         # same as train_utils.get_action: unnormalize deltas, then cumulative sum -> waypoints
         deltas = (act.cpu().numpy() + 1) / 2 * (self.stat_max - self.stat_min) + self.stat_min
         waypoints = np.cumsum(deltas, axis=1)
-        return ActionMsg(frame.seq, frame.t_capture, waypoints=waypoints.astype(np.float32),
-                         infer_ms=(time.perf_counter() - t0) * 1000, spread=float(waypoints.std(axis=0).mean()))
+        spread = float(waypoints.std(axis=0).mean())
+        order = self.rank(waypoints)
+        return ActionMsg(frame.seq, frame.t_capture, waypoints=waypoints[order].astype(np.float32),
+                         infer_ms=(time.perf_counter() - t0) * 1000, spread=spread, chosen=int(order[0]))
+
+    def rank(self, wp: np.ndarray) -> np.ndarray:
+        """Order the samples best-first. wp is (S, T, 2), x forward and y left in the robot frame."""
+        n = wp.shape[0]
+        if self.select == "first" or n == 1:
+            return np.arange(n)
+
+        # heading of the waypoint the client actually steers at, and net forward reach
+        heading = np.arctan2(wp[:, self.waypoint_idx, 1], wp[:, self.waypoint_idx, 0])
+        reach = wp[:, -1, 0]
+        span = float(reach.max() - reach.min())
+        forward = (reach - reach.min()) / span if span > 1e-9 else np.full(n, 0.5)
+
+        if self.prev_heading is None:  # first scored frame of a run: nothing to be consistent with
+            consistent = np.full(n, 0.5)
+        else:
+            consistent = (1 + np.cos(heading - self.prev_heading)) / 2
+
+        if self.select == "forward":
+            score = forward
+        elif self.select == "consistent":
+            score = consistent
+        else:
+            score = (1 - self.consistency_weight) * forward + self.consistency_weight * consistent
+        order = np.argsort(-score)
+
+        # Reference heading for the next frame. The client turns to face its waypoint within DT but
+        # clips at MAX_W, so after a large turn it only gets part of the way there; carry the
+        # remainder. Use the client's own (clipped) formula so this tracks what it will really do.
+        best = int(order[0])
+        w_cmd = RobotControl.waypoint_to_vel(wp[best, self.waypoint_idx], self.waypoint_idx)[1]
+        self.prev_heading = float(heading[best] - w_cmd * DT)
+        return order
 
 
 VIEW_SIZE = 480
@@ -118,7 +173,8 @@ class KeyPoller:
 
 def render(frame: FrameMsg, action: ActionMsg) -> np.ndarray:
     """Left: the frame the model saw, upscaled. Right: top-down view of the sampled trajectories
-    (robot at the bottom, forward is up, left is left; sample 0, the one the robot follows, is green)."""
+    (robot at the bottom, forward is up, left is left; the selected sample, which the server has
+    reordered to index 0 and the robot follows, is green)."""
     img = cv2.resize(cv2.cvtColor(frame.image, cv2.COLOR_RGB2BGR), (VIEW_SIZE, VIEW_SIZE), interpolation=cv2.INTER_CUBIC)
     panel = np.full((VIEW_SIZE, VIEW_SIZE, 3), 30, np.uint8)
     origin = (VIEW_SIZE // 2, VIEW_SIZE - 20)
@@ -146,26 +202,51 @@ def main():
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--device", default=default_device())
     p.add_argument("--num-samples", type=int, default=8)
+    p.add_argument("--select", default="blend", choices=SELECT_MODES,
+                   help="how to pick which of the --num-samples trajectories the robot follows: "
+                        "'first' = sample 0 (old behaviour), 'forward' = furthest reach, "
+                        "'consistent' = closest heading to the previous choice, 'blend' = both")
+    p.add_argument("--consistency-weight", type=float, default=0.7,
+                   help="--select blend: weight on consistency vs forward reach, in [0, 1]")
+    p.add_argument("--waypoint-idx", type=int, default=WAYPOINT_IDX,
+                   help="waypoint the scorer reads the heading from; must match the client's --waypoint-idx")
     p.add_argument("--no-show", action="store_true", help="don't open the live view window (headless machines)")
+    p.add_argument("--record-frames", action="store_true",
+                   help="save the annotated view to a video instead of showing it (needs --out)")
     p.add_argument("--joystick", action="store_true",
                    help="send arrow-key commands to the robot instead of NoMaD's (NoMaD still runs and is displayed)")
     p.add_argument("--speed", type=float, default=1.0, help="joystick speed as a fraction of the robot's max v and w")
     p.add_argument("--hold-ms", type=int, default=400, help="joystick: an arrow key counts as held this long after its last press")
+    p.add_argument("--out", default=None, help="directory for --record-frames output (created if missing)")
     args = p.parse_args()
-    show = not args.no_show
+    show = not args.no_show and not args.record_frames
+    record = args.record_frames
     if args.joystick and not show:
-        raise SystemExit("--joystick needs the window; drop --no-show")
+        raise SystemExit("--joystick needs the window; drop --no-show and --record-frames")
+    if record and not args.out:
+        raise SystemExit("--record-frames needs --out")
     if not 0 < args.speed <= 1:
         raise SystemExit("--speed must be in (0, 1]")
+    if not 0 <= args.consistency_weight <= 1:
+        raise SystemExit("--consistency-weight must be in [0, 1]")
 
     if not os.path.exists(WEIGHTS):
         raise SystemExit(f"Missing weights: {WEIGHTS}")
-    explorer = NomadExplorer(args.device, args.num_samples)
+    explorer = NomadExplorer(args.device, args.num_samples, args.select,
+                             args.consistency_weight, args.waypoint_idx)
     server = InferenceServer(args.port)
     keys = KeyPoller(args.hold_ms / 1000)
+    writer = None
+    if record:
+        os.makedirs(args.out, exist_ok=True)
+        import imageio
+        writer = imageio.get_writer(os.path.join(args.out, "server_view.mp4"), fps=_robot_cfg["frame_rate"])
+        print(f"recording server view to {os.path.join(args.out, 'server_view.mp4')}")
     if show:  # create the window up front so it can take keyboard focus
         cv2.imshow(WINDOW, np.full((VIEW_SIZE, 2 * VIEW_SIZE, 3), 30, np.uint8))
-    print(f"NoMaD ready on {args.device}; waiting for frames on port {args.port}")
+    sel = args.select + (f" (consistency {args.consistency_weight:.2f})" if args.select == "blend" else "")
+    print(f"NoMaD ready on {args.device}; {args.num_samples} samples, select={sel}, "
+          f"waypoint-idx={args.waypoint_idx}; waiting for frames on port {args.port}")
     if args.joystick:
         print("JOYSTICK: the robot gets your commands, not NoMaD's. Click the window; arrows drive, space/s stops, q quits.")
 
@@ -185,14 +266,18 @@ def main():
                 action.velocity = keys.command(args.speed)
             server.send_action(action)
             print(f"seq {frame.seq}: {action.status} infer {action.infer_ms:.1f} ms spread {action.spread:.3f} "
-                  f"vel {action.velocity} {action.error}")
+                  f"chosen {action.chosen} vel {action.velocity} {action.error}")
             if show:
                 cv2.imshow(WINDOW, render(frame, action))
                 keys.poll()
+            if writer is not None:
+                writer.append_data(cv2.cvtColor(render(frame, action), cv2.COLOR_BGR2RGB))
     except KeyboardInterrupt:
         pass
     finally:
         server.close()
+        if writer is not None:
+            writer.close()
         cv2.destroyAllWindows()
 
 

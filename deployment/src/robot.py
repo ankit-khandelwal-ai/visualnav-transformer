@@ -106,20 +106,26 @@ class RobotControl:
         self.safety_filter: Callable[[float, float], Tuple[float, float]] = lambda v, w: (v, w)
 
     # --- action -> velocity -------------------------------------------------------------------
+    # NoMaD's waypoints are cumulative along the planned path: index k is (k+1) steps ahead.
+    # Speed uses that planned time, (k+1)/RATE: the upstream pd_controller divided by DT = 1/RATE,
+    # which overstates v ~(k+1)x so it sits at MAX_V even when the model plans a short path.
+    # Turning keeps the upstream one-step rate (face the waypoint within DT): slowing it by (k+1)x
+    # too made the agent unable to steer around obstacles in sim.
     @staticmethod
-    def waypoint_to_vel(waypoint: np.ndarray) -> Tuple[float, float]:
-        """PD controller from deployment/src/pd_controller.py. waypoint = (dx, dy) in model units."""
+    def waypoint_to_vel(waypoint: np.ndarray, waypoint_idx: int = WAYPOINT_IDX) -> Tuple[float, float]:
+        """waypoint = (dx, dy) in model units at waypoint_idx along the path (repo default idx 2)."""
         dx, dy = (float(waypoint[0]) * MAX_V / RATE, float(waypoint[1]) * MAX_V / RATE)  # model units -> m
+        t = (waypoint_idx + 1) * DT
         if abs(dx) < EPS and abs(dy) < EPS:
             v, w = 0.0, 0.0
         elif abs(dx) < EPS:
             v, w = 0.0, math.copysign(math.pi / (2 * DT), dy)
         else:
-            v, w = dx / DT, math.atan(dy / dx) / DT
+            v, w = dx / t, math.atan(dy / dx) / DT
         return float(np.clip(v, 0, MAX_V)), float(np.clip(w, -MAX_W, MAX_W))
 
     def action_to_vel(self, action: ActionMsg, sample: int = 0, waypoint_idx: int = WAYPOINT_IDX) -> Tuple[float, float]:
-        return self.waypoint_to_vel(action.waypoints[sample][waypoint_idx])
+        return self.waypoint_to_vel(action.waypoints[sample][waypoint_idx], waypoint_idx)
 
     # --- velocity -> wheels -------------------------------------------------------------------
     @staticmethod

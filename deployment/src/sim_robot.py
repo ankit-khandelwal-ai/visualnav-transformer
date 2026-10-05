@@ -11,6 +11,10 @@ Each step: render RGB -> preprocess_frame() (same as robot.py) -> RobotClient.re
 collision detection identical to habitat-lab's VelocityAction (navmesh snap without
 sliding, moved-distance comparison). One JSON line is logged per step.
 
+Exploration metrics in summary.json: coverage (fraction of the navigable floor
+touched by the agent's disc), collision events (consecutive flagged steps deduped
+into one event), collisions per meter, and meters to first collision.
+
 PointNav episodes from habitat-lab provide start/goal (the goal is used only for
 diagnostics; the exploration server masks it).
 """
@@ -24,6 +28,7 @@ import time
 from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy.ndimage import binary_dilation
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -31,12 +36,20 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "train"))
 
 from protocol import DEFAULT_PORT, FrameMsg, RobotClient  # noqa: E402
 from robot import DT, RATE, RobotControl, preprocess_frame  # noqa: E402
+from explore_metrics import augment_summary, write_coverage_csv  # noqa: E402
 
 import habitat_sim  # noqa: E402
 import magnum as mn  # noqa: E402
 from habitat_sim import RigidState  # noqa: E402
 from habitat_sim.physics import VelocityControl  # noqa: E402
 from habitat_sim.utils import common as U  # noqa: E402
+
+STUCK_STEPS = 10  # consecutive blocked steps (2.5 s at 4 Hz) before a run is terminated
+# A step counts as blocked on displacement, not on the collision flag: with
+# allow_sliding the agent keeps wall-following at ~0.1-0.2 m/step while collided=True,
+# which is productive exploration, not being stuck. 0.02 m = 0.08 m/s at 4 Hz, vs the
+# 0.25 m free-space step at MAX_V.
+STUCK_MOVE_M = 0.02
 
 HABITAT_LAB_ROOT = os.path.expanduser("~/repositories/habitat-lab")
 DEFAULT_SCENES_DIR = os.path.expanduser(
@@ -115,11 +128,57 @@ class HabitatVirtualRobot:
 
 def render_topdown(pathfinder, height: float, meters_per_pixel: float = 0.05):
     """Greyscale top-down map of the navmesh slice at `height` (the agent's floor).
-    Returns (img_HWC_uint8, bounds)."""
+    Returns (img_HWC_uint8, bounds, navmask) with navmask True = navigable."""
     bounds = pathfinder.get_bounds()
     mask = pathfinder.get_topdown_view(meters_per_pixel, height)
     img = np.repeat(np.expand_dims(mask, axis=2), 3, axis=2).astype(np.uint8) * 255  # floor white, walls black
-    return img, bounds
+    return img, bounds, mask
+
+
+class CoverageTracker:
+    """Fraction of the navigable floor (spawn-height slice) touched by the agent's disc.
+
+    A cell is visited when the agent (a disc of `agent_radius`) passes over it;
+    coverage = visited∩navigable / navigable. Only the spawn-height navmesh slice is
+    counted, so multi-floor scenes under-report upper floors.
+    """
+
+    def __init__(self, navmask: np.ndarray, bounds, agent_radius: float, mpp: float = 0.05):
+        self.navmask = navmask
+        self.bounds = bounds
+        self.mpp = mpp
+        self.visited = np.zeros_like(navmask, dtype=bool)
+        self.navigable_cells = int(navmask.sum())
+        pad = max(1, int(round(agent_radius / mpp)))
+        yy, xx = np.ogrid[-pad:pad + 1, -pad:pad + 1]
+        self.struct = (xx * xx + yy * yy) <= pad * pad  # disc of ~agent_radius
+        self.curve: List[float] = []  # coverage after each add(), for the coverage curve
+
+    def add(self, position) -> None:
+        r, c = world_to_grid(position[0], position[2], self.bounds, self.mpp)
+        H, W = self.navmask.shape
+        if not (0 <= r < H and 0 <= c < W):
+            self.curve.append(self.coverage)  # off-map step: record flat, skip the disc
+            return
+        marker = np.zeros((H, W), dtype=bool)
+        marker[r, c] = True
+        self.visited |= binary_dilation(marker, structure=self.struct)
+        self.curve.append(self.coverage)
+
+    @property
+    def coverage(self) -> Optional[float]:
+        if self.navigable_cells == 0:
+            return None
+        return float((self.visited & self.navmask).sum()) / self.navigable_cells
+
+
+def draw_coverage_map(out_path, map_img, visited, navmask):
+    """Same top-down map with visited navigable cells painted green."""
+    from PIL import Image
+
+    arr = map_img.copy()
+    arr[visited & navmask] = (120, 220, 120)
+    Image.fromarray(arr).save(out_path)
 
 
 def world_to_grid(x: float, z: float, bounds, mpp: float) -> Tuple[int, int]:
@@ -167,6 +226,8 @@ def main():
     p.add_argument("--save-frames", action="store_true", help="save every camera frame as PNG")
     p.add_argument("--save-video", action="store_true", help="save episode as MP4")
     p.add_argument("--agent-radius", type=float, default=0.18)
+    p.add_argument("--agent-height", type=float, default=0.75,
+                   help="body height; also the navmesh clearance height (overhangs above this are passable)")
     p.add_argument("--camera-height", type=float, default=0.65)
     p.add_argument("--camera-tilt", type=float, default=0.0, help="camera pitch, degrees")
     p.add_argument("--hfov", type=int, default=90)
@@ -183,11 +244,15 @@ def main():
     video_writer = None
     out_dir = None
     map_img = bounds = None
+    navmask = None
     positions: List = []
     collision_positions: List = []
+    collision_flags: List[bool] = []
+    stuck_streak = 0
     goal = None
     infer_times: List[float] = []
     timeouts = 0
+    coverage = None
 
     try:
         # ---------------- sim setup ----------------
@@ -199,7 +264,7 @@ def main():
         backend_cfg.enable_physics = False
 
         agent_cfg = habitat_sim.agent.AgentConfiguration()
-        agent_cfg.height = 1.0
+        agent_cfg.height = args.agent_height
         agent_cfg.radius = args.agent_radius
         cam = habitat_sim.CameraSensorSpec()
         cam.uuid = "rgb"
@@ -214,7 +279,7 @@ def main():
         navmesh_settings = habitat_sim.nav.NavMeshSettings()
         navmesh_settings.set_defaults()
         navmesh_settings.agent_radius = args.agent_radius
-        navmesh_settings.agent_height = 1.5
+        navmesh_settings.agent_height = args.agent_height
         sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
 
         # ---------------- episode start/goal ----------------
@@ -232,7 +297,8 @@ def main():
                                     allow_sliding=args.allow_sliding)
         robot.set_state(start_pos, start_rot)
 
-        map_img, bounds = render_topdown(sim.pathfinder, height=float(start_pos[1]))
+        map_img, bounds, navmask = render_topdown(sim.pathfinder, height=float(start_pos[1]))
+        coverage = CoverageTracker(navmask, bounds, args.agent_radius)
 
         if args.out:
             out_dir = args.out
@@ -275,13 +341,15 @@ def main():
                 status = f"{action.status}" + (f": {action.error}" if action.error else "")
             else:
                 v, w = RobotControl.waypoint_to_vel(
-                    action.waypoints[args.sample][args.waypoint_idx])
+                    action.waypoints[args.sample][args.waypoint_idx], args.waypoint_idx)
                 status = "ok"
                 infer_times.append(action.infer_ms)
 
             collided, moved = robot.act(v, w, DT)
             st = robot.get_state()
             positions.append([st.position[0], st.position[1], st.position[2]])
+            collision_flags.append(collided)
+            coverage.add(positions[-1])
             if collided:
                 collision_positions.append(positions[-1])
 
@@ -299,6 +367,11 @@ def main():
             if log_file:
                 log_file.write(json.dumps(rec) + "\n")
                 log_file.flush()
+            # a run is terminated when the agent can't move for STUCK_STEPS straight steps
+            stuck_streak = stuck_streak + 1 if moved < STUCK_MOVE_M else 0
+            if stuck_streak >= STUCK_STEPS:
+                print(f"stuck for {stuck_streak} steps; terminating run")
+                break
             time.sleep(max(0.0, DT - (time.monotonic() - t_step)))
     except KeyboardInterrupt:
         print("\ninterrupted")
@@ -313,17 +386,45 @@ def main():
             sim.close()
         if out_dir and robot is not None and map_img is not None and positions:
             path = np.array([start_pos] + positions, dtype=np.float64)
+            distance_m = float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
+
+            # dedupe consecutive collided steps into one event (wall-press at 4 Hz = 1 event)
+            flags = [p is not None and p for p in collision_flags]
+            events = int(flags[0]) + sum(1 for a, b in zip(flags, flags[1:]) if b and not a)
+            first_collision_idx = next((i for i, f in enumerate(flags) if f), None)
+            dist_before_first = (
+                round(float(np.linalg.norm(np.diff(path[:first_collision_idx + 2], axis=0), axis=1).sum()), 2)
+                if first_collision_idx is not None else None)
+
             summary = {
                 "steps": len(positions), "collisions": robot.collisions,
-                "distance_m": round(float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()), 2),
+                "collision_events": events,
+                "collision_events_per_m": round(events / distance_m, 3) if distance_m > 0 else None,
+                "meters_to_first_collision": dist_before_first,
+                "coverage": (round(coverage.coverage, 4)
+                             if coverage is not None and coverage.coverage is not None else None),
+                "distance_m": round(distance_m, 2),
                 "final_dist_to_goal": round(float(np.linalg.norm(path[-1] - goal)), 3),
                 "mean_infer_ms": round(float(np.mean(infer_times)), 1) if infer_times else None,
                 "timeouts": timeouts,
+                "terminated_stuck": stuck_streak >= STUCK_STEPS,
             }
             with open(os.path.join(out_dir, "summary.json"), "w") as f:
                 json.dump(summary, f, indent=1)
+            write_coverage_csv(out_dir, coverage.curve)
             draw_map(os.path.join(out_dir, "trajectory_map.png"),
                      map_img, bounds, positions, goal, collision_positions)
+            if coverage is not None:
+                draw_coverage_map(os.path.join(out_dir, "coverage_map.png"),
+                                  map_img, coverage.visited, navmask)
+            # exploration metrics (steps_per_new_cell, revisit ratio, dithering, ...)
+            # computed from the full trajectory after the run ends
+            if coverage is not None and coverage.curve:
+                augment_summary(summary, np.array([start_pos] + positions),
+                                collision_flags, coverage.curve,
+                                args.max_steps, goal, sim.pathfinder)
+                with open(os.path.join(out_dir, "summary.json"), "w") as f:
+                    json.dump(summary, f, indent=1)
             print("summary:", json.dumps(summary))
 
 

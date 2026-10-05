@@ -32,6 +32,7 @@ class ActionMsg:
     waypoints: Optional[np.ndarray] = None  # (num_samples, T, 2) cumulative, in model units
     infer_ms: float = 0.0
     spread: float = 0.0  # std of the sampled trajectories (uncertainty signal)
+    chosen: int = 0  # index, in the server's original sampling order, of the sample now at waypoints[0]
     status: str = "ok"  # "ok" | "warmup" | "error"
     error: str = ""
     velocity: Optional[list] = None  # [v m/s, w rad/s] direct command (joystick mode); used instead of waypoints
@@ -59,6 +60,7 @@ def encode_action(msg: ActionMsg) -> bytes:
         "waypoints": None if msg.waypoints is None else np.asarray(msg.waypoints).tolist(),
         "infer_ms": msg.infer_ms,
         "spread": msg.spread,
+        "chosen": msg.chosen,
         "status": msg.status,
         "error": msg.error,
         "velocity": msg.velocity,
@@ -68,7 +70,9 @@ def encode_action(msg: ActionMsg) -> bytes:
 def decode_action(data: bytes) -> ActionMsg:
     d = json.loads(data)
     wp = None if d["waypoints"] is None else np.array(d["waypoints"], dtype=np.float32)
-    return ActionMsg(d["seq"], d["t_capture"], wp, d["infer_ms"], d["spread"], d["status"], d["error"], d.get("velocity"))
+    return ActionMsg(seq=d["seq"], t_capture=d["t_capture"], waypoints=wp, infer_ms=d["infer_ms"],
+                     spread=d["spread"], chosen=d.get("chosen", 0), status=d["status"], error=d["error"],
+                     velocity=d.get("velocity"))
 
 
 class RobotClient:
