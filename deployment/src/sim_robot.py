@@ -113,12 +113,12 @@ class HabitatVirtualRobot:
         return collided, math.sqrt(max(d_after, 0.0))
 
 
-def render_topdown(pathfinder, meters_per_pixel: float = 0.05):
-    """Greyscale top-down map. Returns (img_HWC_uint8, bounds)."""
+def render_topdown(pathfinder, height: float, meters_per_pixel: float = 0.05):
+    """Greyscale top-down map of the navmesh slice at `height` (the agent's floor).
+    Returns (img_HWC_uint8, bounds)."""
     bounds = pathfinder.get_bounds()
-    height = 0.5 * (bounds[0][1] + bounds[1][1])
     mask = pathfinder.get_topdown_view(meters_per_pixel, height)
-    img = np.repeat(np.expand_dims(~mask, axis=2), 3, axis=2).astype(np.uint8) * 255
+    img = np.repeat(np.expand_dims(mask, axis=2), 3, axis=2).astype(np.uint8) * 255  # floor white, walls black
     return img, bounds
 
 
@@ -232,7 +232,7 @@ def main():
                                     allow_sliding=args.allow_sliding)
         robot.set_state(start_pos, start_rot)
 
-        map_img, bounds = render_topdown(sim.pathfinder)
+        map_img, bounds = render_topdown(sim.pathfinder, height=float(start_pos[1]))
 
         if args.out:
             out_dir = args.out
@@ -312,17 +312,12 @@ def main():
         if sim is not None:
             sim.close()
         if out_dir and robot is not None and map_img is not None and positions:
-            import numpy as _np
-            total_moved = 0.0
-            for i in range(1, len(positions)):
-                total_moved += float(_np.linalg.norm(
-                    _np.array(positions[i]) - _np.array(positions[i - 1])))
+            path = np.array([start_pos] + positions, dtype=np.float64)
             summary = {
-                "steps": len(positions) - 1, "collisions": robot.collisions,
-                "distance_m": round(total_moved, 2),
-                "final_dist_to_goal": round(float(_np.linalg.norm(
-                    _np.array(positions[-1]) - goal)), 3) if goal is not None else None,
-                "mean_infer_ms": round(float(_np.mean(infer_times)), 1) if infer_times else None,
+                "steps": len(positions), "collisions": robot.collisions,
+                "distance_m": round(float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()), 2),
+                "final_dist_to_goal": round(float(np.linalg.norm(path[-1] - goal)), 3),
+                "mean_infer_ms": round(float(np.mean(infer_times)), 1) if infer_times else None,
                 "timeouts": timeouts,
             }
             with open(os.path.join(out_dir, "summary.json"), "w") as f:

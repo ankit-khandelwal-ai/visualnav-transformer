@@ -1,0 +1,8 @@
+{
+ "steps": 120,
+ "collisions": 0,
+ "distance_m": 6.02,
+ "final_dist_to_goal": 11.586,
+ "mean_infer_ms": 41.3,
+ "timeouts": 0
+}
