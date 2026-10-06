@@ -44,7 +44,7 @@ from habitat_sim import RigidState  # noqa: E402
 from habitat_sim.physics import VelocityControl  # noqa: E402
 from habitat_sim.utils import common as U  # noqa: E402
 
-STUCK_STEPS = 10  # consecutive blocked steps (2.5 s at 4 Hz) before a run is terminated
+STUCK_STEPS = 100  # consecutive blocked steps (2.5 s at 4 Hz) before a run is terminated
 # A step counts as blocked on displacement, not on the collision flag: with
 # allow_sliding the agent keeps wall-following at ~0.1-0.2 m/step while collided=True,
 # which is productive exploration, not being stuck. 0.02 m = 0.08 m/s at 4 Hz, vs the
@@ -233,6 +233,10 @@ def main():
     p.add_argument("--hfov", type=int, default=90)
     p.add_argument("--allow-sliding", action="store_true",
                    help="let the agent slide along obstacles on collision (default: no)")
+    p.add_argument("--start", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                   help="start position (snapped to the navmesh); default: random navigable point")
+    p.add_argument("--yaw", type=float, default=0.0,
+                   help="start heading, degrees about +Y; 0 faces -Z, -90 faces +X (check_scene.py convention)")
     p.add_argument("--sim-gpu", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -246,6 +250,7 @@ def main():
     map_img = bounds = None
     navmask = None
     positions: List = []
+    log_recs: List[dict] = []
     collision_positions: List = []
     collision_flags: List[bool] = []
     stuck_streak = 0
@@ -283,7 +288,14 @@ def main():
         sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
 
         # ---------------- episode start/goal ----------------
-        if args.episode:
+        if args.start is not None:
+            start_pos = sim.pathfinder.snap_point(np.array(args.start, dtype=np.float32))
+            rot = U.quat_from_angle_axis(math.radians(args.yaw), np.array([0.0, 1.0, 0.0]))
+            # numpy-quaternion object: read the components, set_state wants [x, y, z, w] coeffs
+            start_rot = [float(rot.x), float(rot.y), float(rot.z), float(rot.w)]
+            goal = np.array(start_pos) + U.quat_rotate_vector(
+                rot, np.array([3.0, 0.0, 0.0], dtype=np.float32))  # diagnostic goal 3 m ahead
+        elif args.episode:
             ep = load_episode(args.episode, args.episode_idx)
             start_pos = np.array(ep["start_position"], dtype=np.float32)
             start_rot = ep["start_rotation"]
@@ -336,6 +348,9 @@ def main():
                 v = w = 0.0
                 status = "timeout"
                 timeouts += 1
+            elif action.velocity is not None:  # joystick: a direct command, same as robot.py
+                v, w = float(action.velocity[0]), float(action.velocity[1])
+                status = "joystick"
             elif action.status != "ok" or action.waypoints is None:
                 v = w = 0.0
                 status = f"{action.status}" + (f": {action.error}" if action.error else "")
@@ -363,12 +378,20 @@ def main():
                 "dist_to_goal": round(float(np.linalg.norm(
                     np.array([st.position[0], st.position[1], st.position[2]]) - goal)), 3),
             }
+            if action is not None and action.closest_node is not None:
+                rec["closest_node"] = action.closest_node
+                rec["reached_goal"] = bool(action.reached_goal)
             print(json.dumps(rec))
+            log_recs.append(rec)
             if log_file:
                 log_file.write(json.dumps(rec) + "\n")
                 log_file.flush()
-            # a run is terminated when the agent can't move for STUCK_STEPS straight steps
-            stuck_streak = stuck_streak + 1 if moved < STUCK_MOVE_M else 0
+            if action is not None and action.reached_goal:
+                print("reached goal node; terminating run")
+                break
+            # a run is terminated when the agent can't move for STUCK_STEPS straight steps;
+            # not under joystick control, where standing still just means no key is held
+            stuck_streak = stuck_streak + 1 if moved < STUCK_MOVE_M and status != "joystick" else 0
             if stuck_streak >= STUCK_STEPS:
                 print(f"stuck for {stuck_streak} steps; terminating run")
                 break
@@ -396,6 +419,7 @@ def main():
                 round(float(np.linalg.norm(np.diff(path[:first_collision_idx + 2], axis=0), axis=1).sum()), 2)
                 if first_collision_idx is not None else None)
 
+            nodes = [r["closest_node"] for r in log_recs if "closest_node" in r]
             summary = {
                 "steps": len(positions), "collisions": robot.collisions,
                 "collision_events": events,
@@ -409,6 +433,10 @@ def main():
                 "timeouts": timeouts,
                 "terminated_stuck": stuck_streak >= STUCK_STEPS,
             }
+            if nodes:  # goal navigation run: success, node progress, localization trace
+                summary["reached_goal_node"] = bool(log_recs[-1].get("reached_goal", False))
+                summary["max_node_reached"] = int(max(nodes))
+                summary["node_trace"] = nodes
             with open(os.path.join(out_dir, "summary.json"), "w") as f:
                 json.dump(summary, f, indent=1)
             write_coverage_csv(out_dir, coverage.curve)

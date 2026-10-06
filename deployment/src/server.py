@@ -18,7 +18,7 @@ import yaml
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from PIL import Image
 
-from latency_bench import build_model, sync, to_tensor
+from latency_bench import NORM, build_model, sync, to_tensor
 from protocol import DEFAULT_PORT, ActionMsg, FrameMsg, InferenceServer
 from robot import DT, WAYPOINT_IDX, RobotControl
 
@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NOMAD_CFG = os.path.join(HERE, "../../train/config/nomad.yaml")
 DATA_CFG = os.path.join(HERE, "../../train/vint_train/data/data_config.yaml")
 WEIGHTS = os.path.join(HERE, "../model_weights/nomad.pth")
+TOPOMAP_IMAGES_DIR = os.path.join(HERE, "../topomaps/images")  # create_topomap.py convention
 with open(os.path.join(HERE, "../config/robot.yaml")) as _f:
     _robot_cfg = yaml.safe_load(_f)
 MAX_V, MAX_W = _robot_cfg["max_v"], _robot_cfg["max_w"]  # the robot clamps to these too
@@ -134,6 +135,87 @@ class NomadExplorer:
         return order
 
 
+class NomadGoalNavigator:
+    """Goal-conditioned NoMaD over a topomap, mirroring navigate.py's logic:
+
+    each step, encode the current obs against the topomap nodes within `radius` of the
+    last localized node (input_goal_mask=0: the goal branch is live), run dist_pred_net
+    to find the closest node, aim at that node or the next one (within close_threshold),
+    and condition the diffusion head on that subgoal encoding. Sample 0 is followed,
+    like navigate.py (no explorer-style ranking: the goal image does the constraining).
+    """
+
+    def __init__(self, device: str, topomap_dir: str, goal_node: int,
+                 radius: int = 4, close_threshold: float = 3.0):
+        self.device = torch.device(device)
+        self.radius = radius
+        self.close_threshold = close_threshold
+        self.cfg = yaml.safe_load(open(NOMAD_CFG))
+        stats = yaml.safe_load(open(DATA_CFG))["action_stats"]
+        self.stat_min, self.stat_max = np.array(stats["min"]), np.array(stats["max"])
+        self.image_size = tuple(self.cfg["image_size"])
+        self.num_iters = self.cfg["num_diffusion_iters"]
+        self.model = build_model(self.cfg, WEIGHTS, self.device)
+        self.sched = DDPMScheduler(num_train_timesteps=self.num_iters,
+                                   beta_schedule="squaredcos_cap_v2",
+                                   clip_sample=True, prediction_type="epsilon")
+        self.context = collections.deque(maxlen=self.cfg["context_size"] + 1)
+        names = sorted(os.listdir(topomap_dir), key=lambda x: int(x.split(".")[0]))
+        self.topomap = [Image.open(os.path.join(topomap_dir, n)).convert("RGB") for n in names]
+        if not -1 <= goal_node < len(self.topomap):
+            raise SystemExit(f"goal node {goal_node} out of range (0..{len(self.topomap) - 1})")
+        self.goal_node = len(self.topomap) - 1 if goal_node == -1 else goal_node
+        self.closest_node = 0
+        self.reached = False
+
+    @torch.no_grad()
+    def step(self, frame: FrameMsg) -> ActionMsg:
+        if frame.seq == 0:  # clients restart seq at 0 for each run
+            self.context.clear()
+            self.closest_node = 0
+            self.reached = False
+        self.context.append(Image.fromarray(frame.image))
+        if len(self.context) < self.context.maxlen:
+            return ActionMsg(frame.seq, frame.t_capture, status="warmup")
+
+        t0 = time.perf_counter()
+        obs = to_tensor(list(self.context), self.image_size).to(self.device)
+        start = max(self.closest_node - self.radius, 0)
+        end = min(self.closest_node + self.radius + 1, self.goal_node)
+        # goal nodes stack along the BATCH dim, one 3ch image each (to_tensor would
+        # concat them along channels like a context; the model wants (N, 3, H, W))
+        goal_batch = torch.stack([NORM(g.resize(self.image_size))
+                                  for g in self.topomap[start:end + 1]]).to(self.device)
+        # 0 = goal visible; one mask value per batch entry (navigate.py: mask.repeat(N))
+        mask = torch.zeros(end - start + 1, dtype=torch.long, device=self.device)
+        cond = self.model("vision_encoder", obs_img=obs.repeat(end - start + 1, 1, 1, 1),
+                          goal_img=goal_batch, input_goal_mask=mask)
+        dists = self.model("dist_pred_net", obsgoal_cond=cond)
+        dists = dists.flatten().detach().cpu().numpy()
+        min_idx = int(np.argmin(dists))
+        self.closest_node = min_idx + start
+        # navigate.py: when close to the best node, steer toward the NEXT one on the way to the goal
+        sg_idx = min(min_idx + int(dists[min_idx] < self.close_threshold), len(cond) - 1)
+        obs_cond = cond[sg_idx].unsqueeze(0)
+        obs_cond = obs_cond.repeat(1, 1) if obs_cond.ndim == 2 else obs_cond.repeat(1, 1, 1)
+
+        act = torch.randn((1, self.cfg["len_traj_pred"], 2), device=self.device)
+        self.sched.set_timesteps(self.num_iters)
+        for k in self.sched.timesteps:
+            noise = self.model("noise_pred_net", sample=act, timestep=k, global_cond=obs_cond)
+            act = self.sched.step(model_output=noise, timestep=k, sample=act).prev_sample
+        sync(self.device)
+        # same as train_utils.get_action: unnormalize deltas, then cumulative sum -> waypoints
+        deltas = (act.cpu().numpy() + 1) / 2 * (self.stat_max - self.stat_min) + self.stat_min
+        waypoints = np.cumsum(deltas, axis=1)
+        self.reached = self.closest_node >= self.goal_node
+        return ActionMsg(frame.seq, frame.t_capture,
+                         waypoints=waypoints.astype(np.float32),
+                         infer_ms=(time.perf_counter() - t0) * 1000,
+                         spread=float(waypoints.std(axis=0).mean()), chosen=0,
+                         closest_node=self.closest_node, reached_goal=self.reached)
+
+
 VIEW_SIZE = 480
 WINDOW = "robot view (q / Esc to quit)"
 
@@ -190,6 +272,8 @@ def render(frame: FrameMsg, action: ActionMsg) -> np.ndarray:
         cv2.circle(panel, pts[3], 6, (0, 255, 255), -1)  # sample 0, waypoint index 2: where the robot steers
 
     lines = [f"seq {frame.seq}  {action.status}", f"infer {action.infer_ms:.0f} ms  spread {action.spread:.2f}"]
+    if action.closest_node is not None:
+        lines.append(f"node {action.closest_node}" + ("  GOAL REACHED" if action.reached_goal else ""))
     if action.velocity is not None:
         lines.append(f"JOYSTICK  v {action.velocity[0]:+.2f} m/s  w {action.velocity[1]:+.2f} rad/s")
     for i, text in enumerate(lines):
@@ -218,11 +302,35 @@ def main():
     p.add_argument("--speed", type=float, default=1.0, help="joystick speed as a fraction of the robot's max v and w")
     p.add_argument("--hold-ms", type=int, default=400, help="joystick: an arrow key counts as held this long after its last press")
     p.add_argument("--out", default=None, help="directory for --record-frames output (created if missing)")
+    p.add_argument("--record-topomap", action="store_true",
+                   help="with --joystick: save topomap node images while you drive (needs --topomap-dir)")
+    p.add_argument("--topomap-dir", default=None,
+                   help="topomap name; images go to ../topomaps/images/<name>/ (create_topomap.py convention)")
+    p.add_argument("--topomap-dt", type=float, default=1.0,
+                   help="seconds between saved topomap nodes (default 1.0, like create_topomap.py --dt)")
+    p.add_argument("--goal-topomap-dir", default=None,
+                   help="goal navigation: topomap name under ../topomaps/images/ (like --topomap-dir)")
+    p.add_argument("--goal-node", type=int, default=-1,
+                   help="goal navigation: goal node index, -1 = the last node (default -1)")
+    p.add_argument("--goal-radius", type=int, default=4,
+                   help="goal navigation: how many nodes around the last localized one to match against (default 4)")
+    p.add_argument("--goal-close-threshold", type=float, default=3.0,
+                   help="goal navigation: dist_pred_net distance below which the next node becomes the subgoal (default 3)")
     args = p.parse_args()
     show = not args.no_show and not args.record_frames
     record = args.record_frames
     if args.joystick and not show:
         raise SystemExit("--joystick needs the window; drop --no-show and --record-frames")
+    if args.record_topomap and not args.joystick:
+        raise SystemExit("--record-topomap is for joystick mode: you drive, it records")
+    if args.record_topomap and not args.topomap_dir:
+        raise SystemExit("--record-topomap needs --topomap-dir")
+    if args.goal_topomap_dir and args.joystick:
+        raise SystemExit("pick one: --joystick (you drive) or --goal-topomap-dir (NoMaD navigates)")
+    if args.goal_topomap_dir and args.record_topomap:
+        raise SystemExit("pick one: --record-topomap (you drive, it records) or --goal-topomap-dir")
+    if args.topomap_dt <= 0:
+        raise SystemExit("--topomap-dt must be positive")
     if record and not args.out:
         raise SystemExit("--record-frames needs --out")
     if not 0 < args.speed <= 1:
@@ -232,16 +340,33 @@ def main():
 
     if not os.path.exists(WEIGHTS):
         raise SystemExit(f"Missing weights: {WEIGHTS}")
-    explorer = NomadExplorer(args.device, args.num_samples, args.select,
-                             args.consistency_weight, args.waypoint_idx)
+    if args.goal_topomap_dir:  # goal navigation: NomadGoalNavigator instead of the explorer
+        goal_dir = os.path.join(TOPOMAP_IMAGES_DIR, args.goal_topomap_dir)
+        if not os.path.isdir(goal_dir):
+            raise SystemExit(f"topomap not found: {goal_dir}")
+        explorer = NomadGoalNavigator(args.device, goal_dir, args.goal_node,
+                                      args.goal_radius, args.goal_close_threshold)
+        print(f"GOAL NAVIGATION: {len(explorer.topomap)} nodes, goal node {explorer.goal_node}, "
+              f"radius {args.goal_radius}, close-threshold {args.goal_close_threshold}")
+    else:
+        explorer = NomadExplorer(args.device, args.num_samples, args.select,
+                                args.consistency_weight, args.waypoint_idx)
     server = InferenceServer(args.port)
     keys = KeyPoller(args.hold_ms / 1000)
     writer = None
+    topo = None  # (dir, dt, next_save_t, count) for --record-topomap
     if record:
         os.makedirs(args.out, exist_ok=True)
         import imageio
         writer = imageio.get_writer(os.path.join(args.out, "server_view.mp4"), fps=_robot_cfg["frame_rate"])
         print(f"recording server view to {os.path.join(args.out, 'server_view.mp4')}")
+    if args.record_topomap:
+        topo_dir = os.path.join(TOPOMAP_IMAGES_DIR, args.topomap_dir)
+        if os.path.isdir(topo_dir):
+            raise SystemExit(f"{topo_dir} already exists; remove it or pick another --topomap-dir")
+        os.makedirs(topo_dir)
+        topo = {"dir": topo_dir, "dt": args.topomap_dt, "next": None, "count": 0}
+        print(f"recording topomap to {topo_dir} (one node every {args.topomap_dt} s)")
     if show:  # create the window up front so it can take keyboard focus
         cv2.imshow(WINDOW, np.full((VIEW_SIZE, 2 * VIEW_SIZE, 3), 30, np.uint8))
     sel = args.select + (f" (consistency {args.consistency_weight:.2f})" if args.select == "blend" else "")
@@ -266,10 +391,21 @@ def main():
                 action.velocity = keys.command(args.speed)
             server.send_action(action)
             print(f"seq {frame.seq}: {action.status} infer {action.infer_ms:.1f} ms spread {action.spread:.3f} "
-                  f"chosen {action.chosen} vel {action.velocity} {action.error}")
+                  f"chosen {action.chosen} vel {action.velocity}"
+                  + (f" node {action.closest_node}" if action.closest_node is not None else "")
+                  + (f" GOAL-REACHED" if action.reached_goal else "")
+                  + (f" {action.error}" if action.error else ""))
             if show:
                 cv2.imshow(WINDOW, render(frame, action))
                 keys.poll()
+            if topo is not None and (topo["next"] is None or frame.t_capture >= topo["next"]):
+                # topomap node: the preprocessed frame the model sees, saved like create_topomap.py
+                # (node 0 at the first frame, then one every topomap-dt s of frame timestamps)
+                from PIL import Image as PILImage
+                PILImage.fromarray(frame.image).save(os.path.join(topo["dir"], f"{topo['count']}.png"))
+                topo["next"] = frame.t_capture + topo["dt"]
+                topo["count"] += 1
+                print(f"topomap node {topo['count'] - 1} saved")
             if writer is not None:
                 writer.append_data(cv2.cvtColor(render(frame, action), cv2.COLOR_BGR2RGB))
     except KeyboardInterrupt:
@@ -278,6 +414,8 @@ def main():
         server.close()
         if writer is not None:
             writer.close()
+        if topo is not None:
+            print(f"topomap done: {topo['count']} nodes in {topo['dir']}")
         cv2.destroyAllWindows()
 
 

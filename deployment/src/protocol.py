@@ -36,6 +36,8 @@ class ActionMsg:
     status: str = "ok"  # "ok" | "warmup" | "error"
     error: str = ""
     velocity: Optional[list] = None  # [v m/s, w rad/s] direct command (joystick mode); used instead of waypoints
+    closest_node: Optional[int] = None  # goal mode: topomap node the robot localized to this step
+    reached_goal: Optional[bool] = None  # goal mode: localized to the goal node
 
 
 def encode_frame(msg: FrameMsg) -> list:
@@ -64,6 +66,8 @@ def encode_action(msg: ActionMsg) -> bytes:
         "status": msg.status,
         "error": msg.error,
         "velocity": msg.velocity,
+        "closest_node": msg.closest_node,
+        "reached_goal": msg.reached_goal,
     }).encode()
 
 
@@ -72,7 +76,8 @@ def decode_action(data: bytes) -> ActionMsg:
     wp = None if d["waypoints"] is None else np.array(d["waypoints"], dtype=np.float32)
     return ActionMsg(seq=d["seq"], t_capture=d["t_capture"], waypoints=wp, infer_ms=d["infer_ms"],
                      spread=d["spread"], chosen=d.get("chosen", 0), status=d["status"], error=d["error"],
-                     velocity=d.get("velocity"))
+                     velocity=d.get("velocity"), closest_node=d.get("closest_node"),
+                     reached_goal=d.get("reached_goal"))
 
 
 class RobotClient:
