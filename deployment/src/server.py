@@ -192,6 +192,7 @@ class NomadGoalNavigator:
                           goal_img=goal_batch, input_goal_mask=mask)
         dists = self.model("dist_pred_net", obsgoal_cond=cond)
         dists = dists.flatten().detach().cpu().numpy()
+        print(f"node dists: {list(zip(range(start, end + 1), np.round(dists, 2).tolist()))}")
         min_idx = int(np.argmin(dists))
         self.closest_node = min_idx + start
         # navigate.py: when close to the best node, steer toward the NEXT one on the way to the goal
@@ -299,7 +300,7 @@ def main():
                    help="save the annotated view to a video instead of showing it (needs --out)")
     p.add_argument("--joystick", action="store_true",
                    help="send arrow-key commands to the robot instead of NoMaD's (NoMaD still runs and is displayed)")
-    p.add_argument("--speed", type=float, default=1.0, help="joystick speed as a fraction of the robot's max v and w")
+    p.add_argument("--speed", type=float, default=0.5, help="joystick speed as a fraction of the robot's max v and w")
     p.add_argument("--hold-ms", type=int, default=400, help="joystick: an arrow key counts as held this long after its last press")
     p.add_argument("--out", default=None, help="directory for --record-frames output (created if missing)")
     p.add_argument("--record-topomap", action="store_true",
