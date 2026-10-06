@@ -160,7 +160,9 @@ class NomadGoalNavigator:
                                    beta_schedule="squaredcos_cap_v2",
                                    clip_sample=True, prediction_type="epsilon")
         self.context = collections.deque(maxlen=self.cfg["context_size"] + 1)
-        names = sorted(os.listdir(topomap_dir), key=lambda x: int(x.split(".")[0]))
+        # only the numbered .png nodes: the folder may also hold a preview .gif
+        names = sorted([f for f in os.listdir(topomap_dir) if f.endswith(".png")],
+                       key=lambda x: int(x.split(".")[0]))
         self.topomap = [Image.open(os.path.join(topomap_dir, n)).convert("RGB") for n in names]
         if not -1 <= goal_node < len(self.topomap):
             raise SystemExit(f"goal node {goal_node} out of range (0..{len(self.topomap) - 1})")

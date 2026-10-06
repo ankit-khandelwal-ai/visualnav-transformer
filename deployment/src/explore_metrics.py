@@ -1,4 +1,4 @@
-"""Exploration metrics shared by sim_robot.py and run_sweep.py.
+"""Exploration metrics shared by sim_robot.py and run_explore_sweep.py.
 
 Everything here derives from three per-run artifacts: the agent's positions
 (1 per step, world frame), the per-step collision flags, and the coverage

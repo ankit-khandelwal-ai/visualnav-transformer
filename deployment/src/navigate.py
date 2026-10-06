@@ -89,10 +89,11 @@ def main(args: argparse.Namespace):
 
     
      # load topomap
-    topomap_filenames = sorted(os.listdir(os.path.join(
-        TOPOMAP_IMAGES_DIR, args.dir)), key=lambda x: int(x.split(".")[0]))
     topomap_dir = f"{TOPOMAP_IMAGES_DIR}/{args.dir}"
-    num_nodes = len(os.listdir(topomap_dir))
+    # only the numbered .png nodes: the folder may also hold a preview .gif
+    topomap_filenames = sorted([f for f in os.listdir(topomap_dir) if f.endswith(".png")],
+                               key=lambda x: int(x.split(".")[0]))
+    num_nodes = len(topomap_filenames)
     topomap = []
     for i in range(num_nodes):
         image_path = os.path.join(topomap_dir, topomap_filenames[i])
