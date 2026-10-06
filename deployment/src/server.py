@@ -167,6 +167,8 @@ class NomadGoalNavigator:
         self.goal_node = len(self.topomap) - 1 if goal_node == -1 else goal_node
         self.closest_node = 0
         self.reached = False
+        self.subgoal_node = None  # node the diffusion head is conditioned on this step
+        self.subgoal_img = None  # its topomap image, for the live view
 
     @torch.no_grad()
     def step(self, frame: FrameMsg) -> ActionMsg:
@@ -197,6 +199,8 @@ class NomadGoalNavigator:
         self.closest_node = min_idx + start
         # navigate.py: when close to the best node, steer toward the NEXT one on the way to the goal
         sg_idx = min(min_idx + int(dists[min_idx] < self.close_threshold), len(cond) - 1)
+        self.subgoal_node = start + sg_idx
+        self.subgoal_img = self.topomap[self.subgoal_node]
         obs_cond = cond[sg_idx].unsqueeze(0)
         obs_cond = obs_cond.repeat(1, 1) if obs_cond.ndim == 2 else obs_cond.repeat(1, 1, 1)
 
@@ -254,10 +258,11 @@ class KeyPoller:
         return [v * speed, w * speed]
 
 
-def render(frame: FrameMsg, action: ActionMsg) -> np.ndarray:
+def render(frame: FrameMsg, action: ActionMsg, subgoal_img=None, subgoal_node=None) -> np.ndarray:
     """Left: the frame the model saw, upscaled. Right: top-down view of the sampled trajectories
     (robot at the bottom, forward is up, left is left; the selected sample, which the server has
-    reordered to index 0 and the robot follows, is green)."""
+    reordered to index 0 and the robot follows, is green). In goal mode, the topomap image the
+    model is steering toward is overlaid on the panel's top-right."""
     img = cv2.resize(cv2.cvtColor(frame.image, cv2.COLOR_RGB2BGR), (VIEW_SIZE, VIEW_SIZE), interpolation=cv2.INTER_CUBIC)
     panel = np.full((VIEW_SIZE, VIEW_SIZE, 3), 30, np.uint8)
     origin = (VIEW_SIZE // 2, VIEW_SIZE - 20)
@@ -271,6 +276,15 @@ def render(frame: FrameMsg, action: ActionMsg) -> np.ndarray:
             color = (0, 255, 0) if s == 0 else (140, 140, 140)
             cv2.polylines(panel, [np.array(pts, np.int32)], False, color, 2 if s == 0 else 1)
         cv2.circle(panel, pts[3], 6, (0, 255, 255), -1)  # sample 0, waypoint index 2: where the robot steers
+
+    if subgoal_img is not None:  # goal mode: the topomap node the model is conditioned on
+        TH, TW = 120, 120  # thumbnail size on the obs frame
+        th = cv2.resize(np.asarray(subgoal_img), (TW, TH), interpolation=cv2.INTER_CUBIC)
+        x0, y0 = VIEW_SIZE - TW - 8, 8  # top-right of the observation frame
+        img[y0:y0 + TH, x0:x0 + TW] = cv2.cvtColor(th, cv2.COLOR_RGB2BGR)
+        cv2.rectangle(img, (x0, y0), (x0 + TW, y0 + TH), (255, 255, 255), 1)
+        cv2.putText(img, f"goal node {subgoal_node}", (x0, y0 + TH + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     lines = [f"seq {frame.seq}  {action.status}", f"infer {action.infer_ms:.0f} ms  spread {action.spread:.2f}"]
     if action.closest_node is not None:
@@ -397,7 +411,8 @@ def main():
                   + (f" GOAL-REACHED" if action.reached_goal else "")
                   + (f" {action.error}" if action.error else ""))
             if show:
-                cv2.imshow(WINDOW, render(frame, action))
+                cv2.imshow(WINDOW, render(frame, action, getattr(explorer, "subgoal_img", None),
+                                          getattr(explorer, "subgoal_node", None)))
                 keys.poll()
             if topo is not None and (topo["next"] is None or frame.t_capture >= topo["next"]):
                 # topomap node: the preprocessed frame the model sees, saved like create_topomap.py
@@ -408,7 +423,9 @@ def main():
                 topo["count"] += 1
                 print(f"topomap node {topo['count'] - 1} saved")
             if writer is not None:
-                writer.append_data(cv2.cvtColor(render(frame, action), cv2.COLOR_BGR2RGB))
+                writer.append_data(cv2.cvtColor(
+                    render(frame, action, getattr(explorer, "subgoal_img", None),
+                           getattr(explorer, "subgoal_node", None)), cv2.COLOR_BGR2RGB))
     except KeyboardInterrupt:
         pass
     finally:
