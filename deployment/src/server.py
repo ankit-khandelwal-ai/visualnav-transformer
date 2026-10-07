@@ -231,14 +231,45 @@ ARROWS = {63232: "up", 63233: "down", 63234: "left", 63235: "right",
           65362: "up", 65364: "down", 65361: "left", 65363: "right"}
 
 
+try:  # real key-down/key-up events, so several arrow keys can be held at once
+    from pynput import keyboard as pynput_kb
+except ImportError:
+    pynput_kb = None
+
+
 class KeyPoller:
-    """Reads keys from the OpenCV window. There are no key-up events, so an arrow key counts as held
-    for `hold_s` after its last press or auto-repeat; only one arrow key can be active at a time."""
+    """Reads keys for joystick mode. With pynput, arrow keys are tracked by real press/release events,
+    so holding up+left drives and turns together with no re-tapping (macOS: grant the terminal Input
+    Monitoring/Accessibility permission; the listener is global, not tied to the window's focus).
+    Without pynput it falls back to the OpenCV window, which has no key-up events: one arrow key at a
+    time, counted as held for `hold_s` after its last press or auto-repeat. q/Esc/space/s always come
+    from the OpenCV window."""
 
     def __init__(self, hold_s: float):
         self.hold_s = hold_s
-        self.key, self.t = None, 0.0
+        self.key, self.t = None, 0.0  # fallback state
+        self.down = set()  # pynput state: arrows currently held
         self.quit = False
+        self.listener = None
+        if pynput_kb is not None:
+            self.listener = pynput_kb.Listener(on_press=self._press, on_release=self._release)
+            self.listener.start()
+
+    def _arrow(self, key):
+        return {pynput_kb.Key.up: "up", pynput_kb.Key.down: "down",
+                pynput_kb.Key.left: "left", pynput_kb.Key.right: "right"}.get(key)
+
+    def _press(self, key):
+        if (a := self._arrow(key)):
+            self.down.add(a)
+
+    def _release(self, key):
+        if (a := self._arrow(key)):
+            self.down.discard(a)
+
+    def close(self):
+        if self.listener is not None:
+            self.listener.stop()
 
     def poll(self):
         for _ in range(32):  # drain everything queued since the last call
@@ -249,14 +280,20 @@ class KeyPoller:
                 self.quit = True
             elif k in (32, ord("s")):  # space or s: stop immediately
                 self.key = None
-            elif k in ARROWS:
+                self.down.clear()
+            elif k in ARROWS and self.listener is None:
                 self.key, self.t = ARROWS[k], time.monotonic()
 
     def command(self, speed: float) -> list:
-        """[v, w] for the held key, scaled by `speed` (fraction of the robot's max speeds)."""
-        if self.key is None or time.monotonic() - self.t > self.hold_s:
-            return [0.0, 0.0]
-        v, w = {"up": (MAX_V, 0.0), "down": (-MAX_V, 0.0), "left": (0.0, MAX_W), "right": (0.0, -MAX_W)}[self.key]
+        """[v, w] for the held keys, scaled by `speed` (fraction of the robot's max speeds)."""
+        if self.listener is not None:
+            held = set(self.down)
+        elif self.key is not None and time.monotonic() - self.t <= self.hold_s:
+            held = {self.key}
+        else:
+            held = set()
+        v = (("up" in held) - ("down" in held)) * MAX_V
+        w = (("left" in held) - ("right" in held)) * MAX_W
         return [v * speed, w * speed]
 
 
@@ -390,7 +427,7 @@ def main():
     print(f"NoMaD ready on {args.device}; {args.num_samples} samples, select={sel}, "
           f"waypoint-idx={args.waypoint_idx}; waiting for frames on port {args.port}")
     if args.joystick:
-        print("JOYSTICK: the robot gets your commands, not NoMaD's. Click the window; arrows drive, space/s stops, q quits.")
+        print("JOYSTICK: the robot gets your commands, not NoMaD's. Click the window; arrows drive (up/down + left/right combine), space/s stops, q quits.")
 
     try:
         while not keys.quit:
@@ -431,6 +468,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        keys.close()
         server.close()
         if writer is not None:
             writer.close()

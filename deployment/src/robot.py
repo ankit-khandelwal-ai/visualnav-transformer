@@ -132,9 +132,13 @@ class RobotControl:
     def vel_to_wheel_rps(v: float, w: float) -> dict:
         """Forward + yaw only. Differential-drive approximation of the chassis."""
         side_speed = {"left": v - w * TRACK_WIDTH_M / 2, "right": v + w * TRACK_WIDTH_M / 2}
+        # Scale both sides together if either exceeds the wheel limit, so the v:w ratio (the arc) survives.
+        # Clipping each wheel independently saturates both at MAX_WHEEL_RPS and erases the turn.
+        max_side = 2 * math.pi * WHEEL_RADIUS_M * MAX_WHEEL_RPS
+        scale = max(1.0, *(abs(s) / max_side for s in side_speed.values()))
         rps = {}
         for motor, (side, sign) in WHEEL_MAP.items():
-            r = sign * side_speed[side] / (2 * math.pi * WHEEL_RADIUS_M)
+            r = sign * (side_speed[side] / scale) / (2 * math.pi * WHEEL_RADIUS_M)
             rps[motor] = float(np.clip(r, -MAX_WHEEL_RPS, MAX_WHEEL_RPS))
         return rps
 
