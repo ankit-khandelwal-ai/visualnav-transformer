@@ -41,6 +41,7 @@ WAYPOINT_IDX = 2  # which of the T predicted waypoints to steer toward (repo def
 WHEEL_RADIUS_M = 0.0325  # PLACEHOLDER
 TRACK_WIDTH_M = 0.30  # PLACEHOLDER: distance between left and right wheels
 MAX_WHEEL_RPS = 1.0
+W_GAIN = 2.0  # >1 = turn harder relative to forward speed (skid-steer scrubs, so effective track is wider)
 # motor id -> (side, sign). sign flips motors so that +rps drives the robot forward.
 # Layout: 1 = front-left, 2 = back-left, 3 = front-right, 4 = back-right. Signs verified with wheels up.
 WHEEL_MAP = {1: ("left", -1), 2: ("left", -1), 3: ("right", +1), 4: ("right", +1)}
@@ -131,7 +132,7 @@ class RobotControl:
     @staticmethod
     def vel_to_wheel_rps(v: float, w: float) -> dict:
         """Forward + yaw only. Differential-drive approximation of the chassis."""
-        side_speed = {"left": v - w * TRACK_WIDTH_M / 2, "right": v + w * TRACK_WIDTH_M / 2}
+        side_speed = {"left": v - W_GAIN * w * TRACK_WIDTH_M / 2, "right": v + W_GAIN * w * TRACK_WIDTH_M / 2}
         # Scale both sides together if either exceeds the wheel limit, so the v:w ratio (the arc) survives.
         # Clipping each wheel independently saturates both at MAX_WHEEL_RPS and erases the turn.
         max_side = 2 * math.pi * WHEEL_RADIUS_M * MAX_WHEEL_RPS
