@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--min-intensity", type=int, default=0)
     ap.add_argument("--raw", action="store_true",
                     help="just print incoming bytes as hex (no parsing, no window)")
+    ap.add_argument("--out", help="snapshot mode: save a PNG here and exit (no window)")
+    ap.add_argument("--duration", type=float, default=2.0,
+                    help="seconds of data to accumulate before the snapshot")
     ap.add_argument("--flip", action="store_true", help="mirror angles (clockwise lidar)")
     args = ap.parse_args()
 
@@ -121,6 +124,7 @@ def main():
     cv2.line(base, (0, cy), (size, cy), (60, 60, 60), 1)
     win = "lidar (q to quit)"
 
+    t0 = time.time()
     try:
         while True:
             for pkt in lidar.read_packets():
@@ -150,6 +154,13 @@ def main():
             cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
             cv2.putText(img, f"{ok.sum()} pts  {rate:.1f} Hz  ok={lidar.good} bad={lidar.bad}",
                         (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if args.out:
+                if time.time() - t0 >= args.duration:
+                    cv2.imwrite(args.out, img)
+                    print(f"saved {args.out}: {ok.sum()} pts, packets ok={lidar.good} "
+                          f"bad={lidar.bad}")
+                    break
+                continue
             cv2.imshow(win, img)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
@@ -157,7 +168,8 @@ def main():
         pass
     finally:
         lidar.ser.close()
-        cv2.destroyAllWindows()
+        if not args.out:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
