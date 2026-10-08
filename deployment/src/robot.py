@@ -192,11 +192,24 @@ def main():
     p.add_argument("--timeout-ms", type=int, default=2000, help="give up on a server reply after this long")
     p.add_argument("--max-steps", type=int, default=0, help="stop after N steps (0 = run until Ctrl-C)")
     p.add_argument("--log", default=None, help="write one JSON line per step to this file")
+    p.add_argument("--lidar-collect", default=None, metavar="DIR",
+                   help="lidar collection mode: while you drive (server.py --joystick), record lidar revolutions "
+                        "to a new session folder under DIR (see lidar_recorder.py)")
+    p.add_argument("--lidar-port", default="/dev/ttyUSB0", help="lidar serial device (--lidar-collect)")
+    p.add_argument("--lidar-baud", type=int, default=230400)
+    p.add_argument("--lidar-label", default="", help="note added to the session name and meta.json")
+    p.add_argument("--lidar-flip", action="store_true", help="record that the lidar angles are mirrored (metadata only)")
     args = p.parse_args()
 
     if args.arm and not CALIBRATED:
         print("WARNING: WHEEL_MAP / wheel geometry are placeholders. Check wheel directions with wheels off the ground.")
     robot = RobotControl(open_board(args.serial_port) if args.arm else None)
+    lidar = None
+    if args.lidar_collect:
+        from lidar_recorder import LidarRecorder  # lazy: pyserial only needed for this mode
+        lidar = LidarRecorder(args.lidar_collect, args.lidar_port, args.lidar_baud, args.lidar_label,
+                              flip=args.lidar_flip, args=vars(args))
+        print(f"LIDAR COLLECTION: recording to {lidar.session}")
     camera = Camera(args.camera)
     client = RobotClient(args.host, args.port, args.timeout_ms)
     log = open(args.log, "w") if args.log else None
@@ -230,6 +243,9 @@ def main():
 
             rec = {"seq": seq, "rtt_ms": round(rtt_ms, 1), "infer_ms": None if action is None else round(action.infer_ms, 1),
                    "spread": None if action is None else round(action.spread, 4), "v": round(v, 3), "w": round(w, 3), "status": status}
+            if lidar:
+                lidar.log_command(round(v, 3), round(w, 3))
+                rec["lidar"] = lidar.status()
             print(rec)
             if log:
                 log.write(json.dumps(rec) + "\n")
@@ -245,6 +261,10 @@ def main():
         client.close()
         if log:
             log.close()
+        if lidar:
+            meta = lidar.close()
+            print(f"Lidar session saved: {lidar.session}\n  {meta['frames']} revolutions in {meta['chunks']} chunks, "
+                  f"packets ok/bad {meta['packets_ok']}/{meta['packets_bad']}, stop: {meta['stop_reason']}")
         print("Stopped.")
 
 
