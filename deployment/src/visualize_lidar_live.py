@@ -6,13 +6,13 @@ Parses the 47-byte packet format used by the LDROBOT LD19 / LD06 family
 run at 230400 baud on /dev/ldlidar. Packets failing CRC are dropped and counted,
 so a high "bad" count means the wrong lidar/protocol or baud rate.
 
-    pip install pyserial matplotlib numpy
+    pip install pyserial opencv-python numpy
     python3 visualize_lidar_live.py --port /dev/ldlidar --range 6
 """
 import argparse
 import time
 
-import matplotlib.pyplot as plt
+import cv2
 import numpy as np
 import serial
 
@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--port", default="/dev/ldlidar")
     ap.add_argument("--baud", type=int, default=230400)
     ap.add_argument("--range", type=float, default=6.0, help="plot half-extent (m)")
+    ap.add_argument("--size", type=int, default=800, help="window size in px")
     ap.add_argument("--min-intensity", type=int, default=0)
     ap.add_argument("--flip", action="store_true", help="mirror angles (clockwise lidar)")
     args = ap.parse_args()
@@ -90,21 +91,20 @@ def main():
     fps_t, revs = time.time(), 0
     rate = 0.0
 
-    fig, ax = plt.subplots(figsize=(7, 7))
-    sc = ax.scatter([], [], s=4, c="tab:blue")
-    ax.plot(0, 0, "r^", markersize=10)
-    ax.set_xlim(args.range, -args.range)  # plot x = y_left (inverted so left is left)
-    ax.set_ylim(-args.range, args.range)  # plot y = x_forward
-    ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlabel("y (m, left)")
-    ax.set_ylabel("x (m, forward)")
-    title = ax.set_title("waiting for data ...")
-    plt.ion()
-    plt.show()
+    size = args.size
+    scale = size / 2 / args.range  # px per meter
+    cx = cy = size // 2
+    base = np.zeros((size, size, 3), np.uint8)
+    for r in range(1, int(args.range) + 1):
+        cv2.circle(base, (cx, cy), int(r * scale), (60, 60, 60), 1)
+        cv2.putText(base, f"{r}m", (cx + 3, cy - int(r * scale) - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (110, 110, 110), 1)
+    cv2.line(base, (cx, 0), (cx, size), (60, 60, 60), 1)
+    cv2.line(base, (0, cy), (size, cy), (60, 60, 60), 1)
+    win = "lidar (q to quit)"
 
     try:
-        while plt.fignum_exists(fig.number):
+        while True:
             for pkt in lidar.read_packets():
                 ang, dist, inten = parse_packet(pkt)
                 if args.flip:
@@ -122,17 +122,24 @@ def main():
             if now - fps_t >= 1.0:
                 rate, revs, fps_t = revs / (now - fps_t), 0, now
             ok = ~np.isnan(pts[:, 0])
-            sc.set_offsets(pts[ok][:, ::-1])  # (y, x)
-            title.set_text(
-                f"{args.port}  {ok.sum()} pts  {rate:.1f} Hz  "
-                f"pkts ok={lidar.good} bad={lidar.bad}"
-            )
-            fig.canvas.draw_idle()
-            plt.pause(0.001)
+            img = base.copy()
+            # x forward -> up, y left -> left
+            px = (cx - pts[ok][:, 1] * scale).astype(int)
+            py = (cy - pts[ok][:, 0] * scale).astype(int)
+            for x, y in zip(px, py):
+                if 0 <= x < size and 0 <= y < size:
+                    cv2.circle(img, (x, y), 2, (255, 180, 0), -1)
+            cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
+            cv2.putText(img, f"{ok.sum()} pts  {rate:.1f} Hz  ok={lidar.good} bad={lidar.bad}",
+                        (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.imshow(win, img)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
     except KeyboardInterrupt:
         pass
     finally:
         lidar.ser.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
