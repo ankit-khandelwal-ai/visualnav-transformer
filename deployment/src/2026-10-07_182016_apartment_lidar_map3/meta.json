@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "port": "/dev/ttyUSB0",
+  "baud": 230400,
+  "label": "apartment_lidar_map3",
+  "lidar_model": "LD19-compatible, unverified",
+  "packet": {
+    "header": [
+      84,
+      44
+    ],
+    "length": 47,
+    "points_per_packet": 12,
+    "angle_unit": "centi-degrees",
+    "dist_unit": "mm"
+  },
+  "flip": false,
+  "chunk_seconds": 30.0,
+  "args": {
+    "host": "192.168.0.230",
+    "port": 5555,
+    "camera": 0,
+    "serial_port": null,
+    "arm": true,
+    "timeout_ms": 2000,
+    "max_steps": 0,
+    "log": null,
+    "lidar_collect": "/home/ankit/recordings/",
+    "lidar_port": "/dev/ttyUSB0",
+    "lidar_baud": 230400,
+    "lidar_label": "apartment_lidar_map3",
+    "lidar_flip": false
+  },
+  "git": {
+    "commit": "878b4b4",
+    "dirty": true
+  },
+  "hostname": "raspberrypi",
+  "python": "3.13.5",
+  "numpy": "2.2.4",
+  "start_wall": "2026-10-07T18:20:16",
+  "start_mono": 5531.120872021,
+  "pyserial": "3.5",
+  "end_wall": "2026-10-07T18:21:07",
+  "duration_s": 51.27,
+  "frames": 513,
+  "chunks": 2,
+  "packets_ok": 19270,
+  "packets_bad": 0,
+  "dropped_chunks": 0,
+  "dropped_partial_frames": 1,
+  "stop_reason": "stopped"
+}

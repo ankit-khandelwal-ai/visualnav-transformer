@@ -348,6 +348,12 @@ def main():
                    help="--select blend: weight on consistency vs forward reach, in [0, 1]")
     p.add_argument("--waypoint-idx", type=int, default=WAYPOINT_IDX,
                    help="waypoint the scorer reads the heading from; must match the client's --waypoint-idx")
+    p.add_argument("--classical", default=None, metavar="MAP_PREFIX",
+                   help="classical baseline instead of NoMaD: localize the streamed lidar scan on this map "
+                        "(e.g. maps/apartment3), plan with RRT, drive with pure pursuit. Robot needs --lidar-stream")
+    p.add_argument("--goal", type=float, nargs=2, metavar=("X", "Y"), help="--classical: goal in map metres")
+    p.add_argument("--start-pose", type=float, nargs=3, metavar=("X", "Y", "DEG"),
+                   help="--classical: robot's starting pose in the map frame (default: first row of <map>_traj.csv)")
     p.add_argument("--no-show", action="store_true", help="don't open the live view window (headless machines)")
     p.add_argument("--record-frames", action="store_true",
                    help="save the annotated view to a video instead of showing it (needs --out)")
@@ -392,9 +398,22 @@ def main():
     if not 0 <= args.consistency_weight <= 1:
         raise SystemExit("--consistency-weight must be in [0, 1]")
 
-    if not os.path.exists(WEIGHTS):
+    if args.classical:
+        if args.joystick or args.goal_topomap_dir or args.record_topomap:
+            raise SystemExit("--classical replaces NoMaD: don't combine it with --joystick / topomap options")
+        if args.goal is None:
+            raise SystemExit("--classical needs --goal X Y (map metres)")
+    elif not os.path.exists(WEIGHTS):
         raise SystemExit(f"Missing weights: {WEIGHTS}")
-    if args.goal_topomap_dir:  # goal navigation: NomadGoalNavigator instead of the explorer
+    if args.classical:
+        from classical_nav import ClassicalNavigator, read_start_pose
+        start = args.start_pose or read_start_pose(args.classical)
+        if start is None:
+            raise SystemExit("no --start-pose and no <map>_traj.csv to read it from")
+        explorer = ClassicalNavigator(args.classical, start, args.goal, MAX_V, MAX_W, args.speed)
+        explorer.save_debug(args.classical)
+        print(f"CLASSICAL NAV: start {start}, goal {tuple(args.goal)}; reachable-space overlay in {args.classical}_free.png")
+    elif args.goal_topomap_dir:  # goal navigation: NomadGoalNavigator instead of the explorer
         goal_dir = os.path.join(TOPOMAP_IMAGES_DIR, args.goal_topomap_dir)
         if not os.path.isdir(goal_dir):
             raise SystemExit(f"topomap not found: {goal_dir}")
@@ -423,6 +442,11 @@ def main():
         print(f"recording topomap to {topo_dir} (one node every {args.topomap_dt} s)")
     if show:  # create the window up front so it can take keyboard focus
         cv2.imshow(WINDOW, np.full((VIEW_SIZE, 2 * VIEW_SIZE, 3), 30, np.uint8))
+    def view(frame, action):
+        if args.classical:
+            return explorer.render(frame, action)
+        return render(frame, action, getattr(explorer, "subgoal_img", None), getattr(explorer, "subgoal_node", None))
+
     sel = args.select + (f" (consistency {args.consistency_weight:.2f})" if args.select == "blend" else "")
     print(f"NoMaD ready on {args.device}; {args.num_samples} samples, select={sel}, "
           f"waypoint-idx={args.waypoint_idx}; waiting for frames on port {args.port}")
@@ -450,8 +474,7 @@ def main():
                   + (f" GOAL-REACHED" if action.reached_goal else "")
                   + (f" {action.error}" if action.error else ""))
             if show:
-                cv2.imshow(WINDOW, render(frame, action, getattr(explorer, "subgoal_img", None),
-                                          getattr(explorer, "subgoal_node", None)))
+                cv2.imshow(WINDOW, view(frame, action))
                 keys.poll()
             if topo is not None and (topo["next"] is None or frame.t_capture >= topo["next"]):
                 # topomap node: the preprocessed frame the model sees, saved like create_topomap.py
@@ -462,9 +485,7 @@ def main():
                 topo["count"] += 1
                 print(f"topomap node {topo['count'] - 1} saved")
             if writer is not None:
-                writer.append_data(cv2.cvtColor(
-                    render(frame, action, getattr(explorer, "subgoal_img", None),
-                           getattr(explorer, "subgoal_node", None)), cv2.COLOR_BGR2RGB))
+                writer.append_data(cv2.cvtColor(view(frame, action), cv2.COLOR_BGR2RGB))
     except KeyboardInterrupt:
         pass
     finally:

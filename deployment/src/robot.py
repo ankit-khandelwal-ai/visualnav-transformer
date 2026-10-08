@@ -195,6 +195,9 @@ def main():
     p.add_argument("--lidar-collect", default=None, metavar="DIR",
                    help="lidar collection mode: while you drive (server.py --joystick), record lidar revolutions "
                         "to a new session folder under DIR (see lidar_recorder.py)")
+    p.add_argument("--lidar-stream", action="store_true",
+                   help="send the latest lidar revolution with every frame (for server.py --classical); "
+                        "uses --lidar-port/--lidar-baud/--lidar-flip; can't be combined with --lidar-collect")
     p.add_argument("--lidar-port", default="/dev/ttyUSB0", help="lidar serial device (--lidar-collect)")
     p.add_argument("--lidar-baud", type=int, default=230400)
     p.add_argument("--lidar-label", default="", help="note added to the session name and meta.json")
@@ -204,6 +207,13 @@ def main():
     if args.arm and not CALIBRATED:
         print("WARNING: WHEEL_MAP / wheel geometry are placeholders. Check wheel directions with wheels off the ground.")
     robot = RobotControl(open_board(args.serial_port) if args.arm else None)
+    if args.lidar_stream and args.lidar_collect:
+        sys.exit("--lidar-stream and --lidar-collect both need the lidar's serial port: pick one")
+    scanner = None
+    if args.lidar_stream:
+        from lidar_live import LidarScanner
+        scanner = LidarScanner(args.lidar_port, args.lidar_baud, args.lidar_flip)
+        print(f"LIDAR STREAM: reading {args.lidar_port}")
     lidar = None
     if args.lidar_collect:
         from lidar_recorder import LidarRecorder  # lazy: pyserial only needed for this mode
@@ -220,7 +230,12 @@ def main():
         while args.max_steps == 0 or seq < args.max_steps:
             t_step = time.monotonic()
             bgr, t_capture = camera.latest()
-            frame = FrameMsg(seq=seq, t_capture=t_capture, image=preprocess_frame(bgr))
+            scan = None
+            if scanner is not None:
+                scan, age = scanner.latest()
+                if age > 0.5:  # a stale scan would mislocalize the robot: send none and let the server wait
+                    scan = None
+            frame = FrameMsg(seq=seq, t_capture=t_capture, image=preprocess_frame(bgr), scan=scan)
 
             t_send = time.monotonic()
             action = client.request(frame)
@@ -243,6 +258,8 @@ def main():
 
             rec = {"seq": seq, "rtt_ms": round(rtt_ms, 1), "infer_ms": None if action is None else round(action.infer_ms, 1),
                    "spread": None if action is None else round(action.spread, 4), "v": round(v, 3), "w": round(w, 3), "status": status}
+            if scanner is not None:
+                rec["lidar"] = scanner.status() + ("" if scan is not None else " NO SCAN")
             if lidar:
                 lidar.log_command(round(v, 3), round(w, 3))
                 rec["lidar"] = lidar.status()
@@ -261,6 +278,8 @@ def main():
         client.close()
         if log:
             log.close()
+        if scanner is not None:
+            scanner.close()
         if lidar:
             meta = lidar.close()
             print(f"Lidar session saved: {lidar.session}\n  {meta['frames']} revolutions in {meta['chunks']} chunks, "

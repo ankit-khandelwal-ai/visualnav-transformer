@@ -23,6 +23,7 @@ class FrameMsg:
     seq: int
     t_capture: float  # sender's clock; echoed back unchanged, never compared across machines
     image: np.ndarray  # RGB uint8, already cropped and resized for the model
+    scan: Optional[np.ndarray] = None  # (N, 2) float32 [angle rad (robot frame, left +), range m]: latest lidar revolution
 
 
 @dataclass
@@ -38,6 +39,9 @@ class ActionMsg:
     velocity: Optional[list] = None  # [v m/s, w rad/s] direct command (joystick mode); used instead of waypoints
     closest_node: Optional[int] = None  # goal mode: topomap node the robot localized to this step
     reached_goal: Optional[bool] = None  # goal mode: localized to the goal node
+    pose: Optional[list] = None  # classical mode: [x m, y m, theta rad] in the map frame
+    path: Optional[list] = None  # classical mode: [[x, y], ...] planned path in the map frame
+    info: str = ""  # classical mode: free-text localization / planner status
 
 
 def encode_frame(msg: FrameMsg) -> list:
@@ -45,14 +49,20 @@ def encode_frame(msg: FrameMsg) -> list:
     ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     if not ok:
         raise RuntimeError("JPEG encoding failed")
-    header = json.dumps({"seq": msg.seq, "t_capture": msg.t_capture}).encode()
-    return [header, buf.tobytes()]
+    header = json.dumps({"seq": msg.seq, "t_capture": msg.t_capture, "has_scan": msg.scan is not None}).encode()
+    parts = [header, buf.tobytes()]
+    if msg.scan is not None:
+        parts.append(np.asarray(msg.scan, dtype="<f4").tobytes())
+    return parts
 
 
 def decode_frame(parts: list) -> FrameMsg:
     header = json.loads(parts[0])
     bgr = cv2.imdecode(np.frombuffer(parts[1], np.uint8), cv2.IMREAD_COLOR)
-    return FrameMsg(header["seq"], header["t_capture"], cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    scan = None
+    if header.get("has_scan") and len(parts) > 2:
+        scan = np.frombuffer(parts[2], dtype="<f4").reshape(-1, 2).copy()
+    return FrameMsg(header["seq"], header["t_capture"], cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), scan)
 
 
 def encode_action(msg: ActionMsg) -> bytes:
@@ -68,6 +78,9 @@ def encode_action(msg: ActionMsg) -> bytes:
         "velocity": msg.velocity,
         "closest_node": msg.closest_node,
         "reached_goal": msg.reached_goal,
+        "pose": msg.pose,
+        "path": msg.path,
+        "info": msg.info,
     }).encode()
 
 
@@ -77,7 +90,8 @@ def decode_action(data: bytes) -> ActionMsg:
     return ActionMsg(seq=d["seq"], t_capture=d["t_capture"], waypoints=wp, infer_ms=d["infer_ms"],
                      spread=d["spread"], chosen=d.get("chosen", 0), status=d["status"], error=d["error"],
                      velocity=d.get("velocity"), closest_node=d.get("closest_node"),
-                     reached_goal=d.get("reached_goal"))
+                     reached_goal=d.get("reached_goal"), pose=d.get("pose"), path=d.get("path"),
+                     info=d.get("info", ""))
 
 
 class RobotClient:
