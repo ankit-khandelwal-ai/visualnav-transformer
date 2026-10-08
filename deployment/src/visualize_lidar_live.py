@@ -80,10 +80,28 @@ def main():
     ap.add_argument("--range", type=float, default=6.0, help="plot half-extent (m)")
     ap.add_argument("--size", type=int, default=800, help="window size in px")
     ap.add_argument("--min-intensity", type=int, default=0)
+    ap.add_argument("--raw", action="store_true",
+                    help="just print incoming bytes as hex (no parsing, no window)")
     ap.add_argument("--flip", action="store_true", help="mirror angles (clockwise lidar)")
     args = ap.parse_args()
 
     lidar = LidarReader(args.port, args.baud)
+
+    if args.raw:
+        total = 0
+        try:
+            while True:
+                data = lidar.ser.read(max(lidar.ser.in_waiting, 1))
+                if data:
+                    total += len(data)
+                    print(f"[{total:>8}] {len(data):>4}B  {data.hex(' ')}", flush=True)
+                else:
+                    print("(no data)", flush=True)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            lidar.ser.close()
+        return
 
     # Accumulate one revolution: points keyed by 1-degree bin, newest wins.
     pts = np.full((360, 2), np.nan)  # x forward, y left
